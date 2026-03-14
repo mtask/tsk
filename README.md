@@ -92,7 +92,7 @@ tsk add --note "Check expiry" "Buy milk"  # with notes
 Flags and text can appear in any order:
 
 ```bash
-tsk add @koti -p high --due 2026-03-31 "Pyydä vakuutustarjous"
+tsk add @home -p high --due 2026-03-31 "Ask for some offer"
 ```
 
 ### List tasks
