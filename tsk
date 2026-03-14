@@ -17,7 +17,7 @@ from rich.table import Table
 
 STATE_PATH = os.path.expanduser("~/.local/share/tasker/state.json")
 CONFIG_SEARCH_PATHS = [
-    os.path.expanduser("~/.config/tasker/conf.yaml"),
+    os.path.expanduser("~/.config/tsk/conf.yaml"),
 ]
 
 PRIORITY_MAP = {
@@ -95,9 +95,18 @@ def parse_due(value):
 
 # ── CalDAV helpers ────────────────────────────────────────────────────────────
 
+def _cal_display_name(cal):
+    """Return calendar display name, compatible with caldav 1.x and 2.x."""
+    try:
+        return cal.get_display_name()
+    except AttributeError:
+        return cal.name  # caldav < 2.0
+
+
 def get_or_create_calendar(principal, name):
     for cal in principal.calendars():
-        if cal.name and cal.name.lower() == name.lower():
+        cal_name = _cal_display_name(cal)
+        if cal_name and cal_name.lower() == name.lower():
             return cal
     print(f"Creating calendar: {name}")
     return principal.make_calendar(name=name)

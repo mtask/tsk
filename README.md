@@ -18,7 +18,7 @@ A minimal **command-line task manager** backed by any **CalDAV server** (Nextclo
 - Move tasks between projects with `move`
 - Edit summary, priority, due date, or notes in place
 - Create new CalDAV calendars and config entries with `project add`
-- Auto-discovers config at `~/.config/tasker/conf.yaml`
+- Auto-discovers config at `~/.config/tsk/conf.yaml`
 - Compatible with Apple Reminders and other CalDAV clients
 
 ---
@@ -30,10 +30,10 @@ git clone <repo>
 cd tsk
 python3 -m venv venv
 source venv/bin/activate
-pip install caldav pyyaml rich
+pip install caldav pyyaml rich vobject
 
-# Install the command to ~/.local/bin (no root needed)
-ln -s "$PWD/tsk" ~/.local/bin/tsk
+# Install wrapper command to ~/.local/bin (no root needed)
+echo -e '#!/bin/bash'"\n$PWD/venv/bin/python3 $PWD/tsk \$@" > ~/.local/bin/tsk && chmod 755 ~/.local/bin/tsk
 ```
 
 Make sure `~/.local/bin` is on your `PATH`. On most modern Linux distros it is by default. If not, add to `~/.bashrc` or `~/.profile`:
@@ -48,7 +48,7 @@ Requires Python 3.8+.
 
 ## Configuration
 
-Place `conf.yaml` at `~/.config/tasker/conf.yaml` (auto-discovered) or pass with `-c`:
+Place `conf.yaml` at `~/.config/tsk/conf.yaml` (auto-discovered) or pass with `-c`:
 
 ```yaml
 projects:
@@ -208,7 +208,7 @@ venv/bin/python -m pytest test_tsk.py -m "not integration"
 
 # Integration tests (requires TASK_CONFIG_PATH and a live CalDAV server)
 # Uses a calendar named TEST, created and cleaned up automatically
-TASK_CONFIG_PATH=~/.config/tasker/conf.yaml \
+TASK_CONFIG_PATH=~/.config/tsk/conf.yaml \
   venv/bin/python -m pytest test_tsk.py -m integration -v
 ```
 
