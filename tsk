@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone, date
+from uuid import uuid4
+
+import caldav
+import yaml
+from rich.console import Console
+from rich.table import Table
+
+STATE_PATH = os.path.expanduser("~/.local/share/tasker/state.json")
+CONFIG_SEARCH_PATHS = [
+    os.path.expanduser("~/.config/tasker/conf.yaml"),
+]
+
+PRIORITY_MAP = {
+    "undefined": "0",
+    "high": "1",
+    "medium": "5",
+    "low": "9",
+}
+
+PRIORITY_LABEL = {"1": "high", "5": "medium", "9": "low", "0": ""}
+PRIORITY_SORT  = {"1": 0, "5": 1, "9": 2, "0": 3}
+REVERSE_PRIORITY = {v: k for k, v in PRIORITY_MAP.items()}  # "1"->"high" etc.
+
+console = Console()
+
+
+# ── Config / State ────────────────────────────────────────────────────────────
+
+def find_config():
+    for path in CONFIG_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_config(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def get_project_values(project, config):
+    proj = config["projects"][project]
+    return proj["url"], proj["username"], proj["password"]
+
+
+def load_state():
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+# ── Due date parsing ──────────────────────────────────────────────────────────
+
+def parse_due(value):
+    now = datetime.now(timezone.utc)
+
+    if value.endswith("m"):
+        return now + timedelta(minutes=int(value[:-1]))
+    if value.endswith("h"):
+        return now + timedelta(hours=int(value[:-1]))
+    if value.endswith("d"):
+        return now + timedelta(days=int(value[:-1]))
+
+    if value == "tomorrow":
+        return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+
+    if value.startswith("tomorrow "):
+        hour = int(value.split()[1])
+        return (now + timedelta(days=1)).replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    raise RuntimeError(f"Unsupported due format: {value!r}")
+
+
+# ── CalDAV helpers ────────────────────────────────────────────────────────────
+
+def get_or_create_calendar(principal, name):
+    for cal in principal.calendars():
+        if cal.name and cal.name.lower() == name.lower():
+            return cal
+    print(f"Creating calendar: {name}")
+    return principal.make_calendar(name=name)
+
+
+def get_calendar(project, config):
+    url, user, password = get_project_values(project, config)
+    client = caldav.DAVClient(url=url, username=user, password=password, ssl_verify_cert=False)
+    principal = client.principal()
+    return get_or_create_calendar(principal, project), principal
+
+
+# ── Task operations ───────────────────────────────────────────────────────────
+
+def create_task(calendar, text, due=None, priority_arg="undefined", note=None):
+    priority = PRIORITY_MAP.get(priority_arg, "0")
+
+    uid = str(uuid4())
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//CLI CalDAV Tasks//EN",
+        "BEGIN:VTODO",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"SUMMARY:{text}",
+        f"PRIORITY:{priority}",
+        "STATUS:NEEDS-ACTION",
+    ]
+
+    if note:
+        lines.append(f"DESCRIPTION:{note}")
+
+    if due:
+        lines.append(f"DUE:{due.strftime('%Y%m%dT%H%M%SZ')}")
+        lines += [
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            "DESCRIPTION:Reminder",
+            "TRIGGER:-PT0M",
+            "END:VALARM",
+        ]
+
+    lines += ["END:VTODO", "END:VCALENDAR", ""]
+
+    calendar.add_todo("\r\n".join(lines))
+    print("✓ Task added")
+
+
+def _parse_todo(todo, index, today):
+    """Parse a CalDAV todo object into a dict."""
+    v = todo.vobject_instance.vtodo
+
+    summary     = getattr(v, "summary", None)
+    due         = getattr(v, "due", None)
+    priority    = getattr(v, "priority", None)
+    status      = getattr(v, "status", None)
+    uid         = getattr(v, "uid", None)
+    description = getattr(v, "description", None)
+
+    due_val = due.value if due else None
+    if due_val is None:
+        due_date = None
+    elif isinstance(due_val, datetime):
+        due_date = due_val.date()
+    else:
+        due_date = due_val  # already a date object
+
+    due_str  = due_val.isoformat() if due_val else None
+    prio_raw = str(priority.value) if priority else "0"
+    status_val = status.value if status else "NEEDS-ACTION"
+
+    return {
+        "index":       index,
+        "uid":         uid.value if uid else None,
+        "summary":     summary.value if summary else "",
+        "note":        description.value if description else None,
+        "due":         due_str,
+        "due_date":    due_date,
+        "priority":    PRIORITY_LABEL.get(prio_raw, ""),
+        "priority_raw": prio_raw,
+        "status":      status_val,
+        "completed":   status_val == "COMPLETED",
+        "overdue":     due_date is not None and due_date < today and status_val != "COMPLETED",
+        "due_today":   due_date is not None and due_date == today and status_val != "COMPLETED",
+    }
+
+
+def fetch_tasks(calendar, include_completed=False):
+    today = datetime.now(timezone.utc).date()
+    todos = calendar.todos(include_completed=include_completed)
+    tasks = [_parse_todo(t, i, today) for i, t in enumerate(todos, start=1)]
+    return sort_tasks(tasks)
+
+
+def sort_tasks(tasks):
+    """Sort by due date ascending (nulls last), then priority high-first."""
+    def key(t):
+        return (t["due_date"] or date.max, PRIORITY_SORT.get(t["priority_raw"], 3))
+    return sorted(tasks, key=key)
+
+
+def format_due_display(due_date, today=None):
+    if due_date is None:
+        return ""
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    delta = (due_date - today).days
+    if delta == 0:
+        return "today"
+    elif delta == 1:
+        return "tomorrow"
+    elif delta < 0:
+        return f"{abs(delta)}d overdue"
+    else:
+        return f"in {delta}d"
+
+
+def print_tasks_table(tasks, title="Tasks", show_status=False):
+    if not tasks:
+        console.print("[dim]No tasks.[/dim]")
+        return
+
+    today = datetime.now(timezone.utc).date()
+
+    table = Table(title=title, show_header=True, header_style="bold")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Summary")
+    table.add_column("Pri", width=8)
+    table.add_column("Due", width=14)
+    if show_status:
+        table.add_column("Status", width=12)
+
+    for task in tasks:
+        due_disp = format_due_display(task["due_date"], today)
+
+        if task["completed"]:
+            style = "dim"
+        elif task["overdue"]:
+            style = "red"
+        elif task["due_today"]:
+            style = "yellow"
+        elif task["priority_raw"] == "1":
+            style = "bold"
+        else:
+            style = ""
+
+        row = [str(task["index"]), task["summary"], task["priority"], due_disp]
+        if show_status:
+            row.append(task["status"].replace("NEEDS-ACTION", "pending").lower())
+
+        table.add_row(*row, style=style)
+
+    console.print(table)
+
+
+# ── Project resolution ────────────────────────────────────────────────────────
+
+def resolve_project(words, state, config):
+    """Extract @project from words list, or fall back to active state."""
+    project = None
+    remaining = []
+    for w in (words or []):
+        if w.startswith("@"):
+            project = w[1:]
+        else:
+            remaining.append(w)
+
+    if project is None:
+        project = state.get("project")
+
+    if not project:
+        print("No active project. Use: tsk use <project>  or  @project in args")
+        sys.exit(1)
+
+    if project not in config.get("projects", {}):
+        print(f"Unknown project: {project!r}")
+        sys.exit(1)
+
+    return project, remaining
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_use(args, config, _config_path):
+    project = args.project
+    if project not in config.get("projects", {}):
+        print(f"Unknown project: {project!r}")
+        sys.exit(1)
+    state = load_state()
+    state["project"] = project
+    save_state(state)
+    print(f"Active project set to: {project}")
+
+
+def cmd_add(args, config, _config_path):
+    state = load_state()
+    project, words = resolve_project(args.words, state, config)
+    text = " ".join(words).strip()
+    if not text:
+        print("Error: no task text provided")
+        sys.exit(1)
+
+    due = parse_due(args.due) if args.due else None
+    calendar, _ = get_calendar(project, config)
+    create_task(calendar, text, due, priority_arg=args.priority or "undefined", note=args.note)
+
+
+def cmd_list(args, config, _config_path):
+    state = load_state()
+
+    if args.project_name:
+        project = args.project_name
+        if project not in config.get("projects", {}):
+            print(f"Unknown project: {project!r}")
+            sys.exit(1)
+    else:
+        project = state.get("project")
+        if not project:
+            print("No active project. Use: tsk use <project>")
+            sys.exit(1)
+
+    calendar, _ = get_calendar(project, config)
+    tasks = fetch_tasks(calendar, include_completed=args.all)
+
+    if args.priority:
+        tasks = [t for t in tasks if t["priority"] == args.priority]
+    if args.overdue:
+        tasks = [t for t in tasks if t["overdue"]]
+    if args.today:
+        tasks = [t for t in tasks if t["due_today"]]
+
+    print_tasks_table(tasks, title=f"Project: {project}", show_status=args.all)
+
+
+def cmd_next(args, config, _config_path):
+    state = load_state()
+    project = state.get("project")
+    if not project:
+        print("No active project. Use: tsk use <project>")
+        sys.exit(1)
+
+    calendar, _ = get_calendar(project, config)
+    tasks = fetch_tasks(calendar)
+    urgent = [t for t in tasks if t["overdue"] or t["due_today"] or t["priority_raw"] == "1"]
+    print_tasks_table(urgent, title=f"Next: {project}")
+
+
+def cmd_show(args, config, _config_path):
+    state = load_state()
+    project = state.get("project")
+    if not project:
+        print("No active project. Use: tsk use <project>")
+        sys.exit(1)
+
+    calendar, _ = get_calendar(project, config)
+    todos = calendar.todos()
+
+    if args.index < 1 or args.index > len(todos):
+        print(f"Invalid index: {args.index}")
+        sys.exit(1)
+
+    today = datetime.now(timezone.utc).date()
+    task = _parse_todo(todos[args.index - 1], args.index, today)
+
+    due_disp = format_due_display(task["due_date"], today)
+    if task["due_date"]:
+        due_str = f"{task['due_date'].isoformat()}  ({due_disp})" if due_disp else task["due_date"].isoformat()
+    else:
+        due_str = "—"
+
+    console.print(f"[bold]Summary:[/bold]  {task['summary']}")
+    console.print(f"[bold]Priority:[/bold] {task['priority'] or '—'}")
+    console.print(f"[bold]Due:[/bold]      {due_str}")
+    console.print(f"[bold]Status:[/bold]   {task['status']}")
+    if task["note"]:
+        console.print(f"[bold]Note:[/bold]     {task['note']}")
+
+
+def cmd_done(args, config, _config_path):
+    state = load_state()
+    project = state.get("project")
+    if not project:
+        print("No active project. Use: tsk use <project>")
+        sys.exit(1)
+
+    calendar, _ = get_calendar(project, config)
+    todos = calendar.todos()
+
+    if args.index < 1 or args.index > len(todos):
+        print(f"Invalid index: {args.index}")
+        sys.exit(1)
+
+    todo = todos[args.index - 1]
+    v = todo.vobject_instance
+    v.vtodo.status.value = "COMPLETED"
+    todo.data = v.serialize()
+    todo.save()
+    print("✓ Task completed")
+
+
+def cmd_del(args, config, _config_path):
+    state = load_state()
+    project = state.get("project")
+    if not project:
+        print("No active project. Use: tsk use <project>")
+        sys.exit(1)
+
+    calendar, _ = get_calendar(project, config)
+    todos = calendar.todos()
+
+    if args.index < 1 or args.index > len(todos):
+        print(f"Invalid index: {args.index}")
+        sys.exit(1)
+
+    todos[args.index - 1].delete()
+    print("✓ Task deleted")
+
+
+def cmd_edit(args, config, _config_path):
+    state = load_state()
+    project = state.get("project")
+    if not project:
+        print("No active project. Use: tsk use <project>")
+        sys.exit(1)
+
+    calendar, _ = get_calendar(project, config)
+    todos = calendar.todos()
+
+    if args.index < 1 or args.index > len(todos):
+        print(f"Invalid index: {args.index}")
+        sys.exit(1)
+
+    todo = todos[args.index - 1]
+    v = todo.vobject_instance
+    changed = False
+
+    if args.summary:
+        v.vtodo.summary.value = args.summary
+        changed = True
+
+    if args.priority:
+        prio_str = PRIORITY_MAP.get(args.priority, "0")  # must be string
+        if hasattr(v.vtodo, "priority"):
+            v.vtodo.priority.value = prio_str
+        else:
+            v.vtodo.add("priority").value = prio_str
+        changed = True
+
+    if args.due:
+        if args.due == "none":
+            if "due" in v.vtodo.contents:
+                del v.vtodo.contents["due"]
+        else:
+            due_dt = parse_due(args.due)
+            naive_due = due_dt.replace(tzinfo=None)  # naive datetime avoids VObjectError
+            if hasattr(v.vtodo, "due"):
+                v.vtodo.due.value = naive_due
+            else:
+                v.vtodo.add("due").value = naive_due
+        changed = True
+
+    if args.note is not None:
+        if args.note == "none":
+            if "description" in v.vtodo.contents:
+                del v.vtodo.contents["description"]
+        else:
+            if hasattr(v.vtodo, "description"):
+                v.vtodo.description.value = args.note
+            else:
+                v.vtodo.add("description").value = args.note
+        changed = True
+
+    if not changed:
+        print("Nothing to edit. Use --summary, -p, --due, or --note")
+        sys.exit(1)
+
+    todo.data = v.serialize()
+    todo.save()
+    print("✓ Task updated")
+
+
+def cmd_move(args, config, _config_path):
+    state = load_state()
+    project = state.get("project")
+    if not project:
+        print("No active project. Use: tsk use <project>")
+        sys.exit(1)
+
+    target = args.target.lstrip("@")
+    if target not in config.get("projects", {}):
+        print(f"Unknown project: {target!r}")
+        sys.exit(1)
+
+    if target == project:
+        print("Source and target project are the same")
+        sys.exit(1)
+
+    src_cal, _ = get_calendar(project, config)
+    todos = src_cal.todos()
+
+    if args.index < 1 or args.index > len(todos):
+        print(f"Invalid index: {args.index}")
+        sys.exit(1)
+
+    today = datetime.now(timezone.utc).date()
+    task = _parse_todo(todos[args.index - 1], args.index, today)
+
+    # Reconstruct due as an aware UTC datetime for create_task
+    due_dt = None
+    if task["due_date"]:
+        due_dt = datetime.combine(task["due_date"], datetime.min.time()).replace(tzinfo=timezone.utc)
+
+    dst_cal, _ = get_calendar(target, config)
+    priority_name = REVERSE_PRIORITY.get(task["priority_raw"], "undefined")
+    create_task(dst_cal, task["summary"], due=due_dt, priority_arg=priority_name, note=task["note"])
+
+    todos[args.index - 1].delete()
+    print(f"✓ Moved to {target!r}")
+
+
+def cmd_project_list(_args, config, _config_path):
+    state = load_state()
+    active = state.get("project")
+    projects = config.get("projects", {})
+    if not projects:
+        console.print("[dim]No projects configured.[/dim]")
+        return
+    for name in projects:
+        marker = "* " if name == active else "  "
+        console.print(f"{marker}{name}")
+
+
+def cmd_project_add(args, config, config_path):
+    name = args.name
+    if name in config.get("projects", {}):
+        print(f"Project already exists: {name!r}")
+        sys.exit(1)
+
+    projects = config.get("projects", {})
+    if not projects:
+        print("No existing projects to derive credentials from")
+        sys.exit(1)
+
+    first = next(iter(projects.values()))
+    client = caldav.DAVClient(
+        url=first["url"],
+        username=first["username"],
+        password=first["password"],
+        ssl_verify_cert=False,
+    )
+    principal = client.principal()
+    calendar = principal.make_calendar(name=name)
+
+    config["projects"][name] = {
+        "url": str(calendar.url),
+        "username": first["username"],
+        "password": first["password"],
+    }
+
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    print(f"✓ Project {name!r} created: {calendar.url}")
+
+
+# ── Parser ────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="tsk", description="CalDAV task manager")
+    parser.add_argument("-c", "--config", metavar="FILE", help="Path to YAML config")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # use
+    p_use = sub.add_parser("use", help="Set active project")
+    p_use.add_argument("project")
+
+    # add
+    p_add = sub.add_parser("add", help="Add a task")
+    p_add.add_argument("words", nargs="*", help="Task text (may include @project)")
+    p_add.add_argument("-p", "--priority", choices=["low", "medium", "high"])
+    p_add.add_argument("--due")
+    p_add.add_argument("--note", help="Task description/notes")
+
+    # list
+    p_list = sub.add_parser("list", help="List tasks")
+    p_list.add_argument("project_name", nargs="?", help="Project name")
+    p_list.add_argument("-p", "--priority", choices=["low", "medium", "high"])
+    p_list.add_argument("--overdue", action="store_true")
+    p_list.add_argument("--today", action="store_true")
+    p_list.add_argument("--all", dest="all", action="store_true",
+                        help="Include completed tasks")
+
+    # next
+    sub.add_parser("next", help="Show urgent tasks (overdue + today + high priority)")
+
+    # show
+    p_show = sub.add_parser("show", help="Show full task details")
+    p_show.add_argument("index", type=int)
+
+    # done
+    p_done = sub.add_parser("done", help="Complete a task by index")
+    p_done.add_argument("index", type=int)
+
+    # del
+    p_del = sub.add_parser("del", help="Delete a task by index")
+    p_del.add_argument("index", type=int)
+
+    # edit
+    p_edit = sub.add_parser("edit", help="Edit a task")
+    p_edit.add_argument("index", type=int)
+    p_edit.add_argument("--summary")
+    p_edit.add_argument("-p", "--priority", choices=["low", "medium", "high"])
+    p_edit.add_argument("--due", help="New due date, or 'none' to clear")
+    p_edit.add_argument("--note", help="Notes/description, or 'none' to clear")
+
+    # move
+    p_move = sub.add_parser("move", help="Move a task to another project")
+    p_move.add_argument("index", type=int)
+    p_move.add_argument("target", help="Target project (with or without @)")
+
+    # project
+    p_proj = sub.add_parser("project", help="Manage projects")
+    proj_sub = p_proj.add_subparsers(dest="proj_cmd", required=True)
+    proj_sub.add_parser("list", help="List configured projects")
+    p_proj_add = proj_sub.add_parser("add", help="Create a new CalDAV calendar + config entry")
+    p_proj_add.add_argument("name")
+
+    return parser, p_add
+
+
+COMMANDS = {
+    "use":  cmd_use,
+    "add":  cmd_add,
+    "list": cmd_list,
+    "next": cmd_next,
+    "show": cmd_show,
+    "done": cmd_done,
+    "del":  cmd_del,
+    "edit": cmd_edit,
+    "move": cmd_move,
+}
+
+
+def main():
+    parser, p_add = build_parser()
+
+    # For 'add', use parse_intermixed_args so flags and words can appear in any
+    # order (e.g. "tsk add @proj -p high --due tomorrow 'some text'").
+    # Find the position of 'add' in argv, skipping any leading -c/--config pair.
+    raw = sys.argv[1:]
+    add_idx = None
+    i = 0
+    while i < len(raw):
+        if raw[i] in ('-c', '--config'):
+            i += 2
+        elif raw[i] == 'add':
+            add_idx = i
+            break
+        else:
+            i += 1
+
+    if add_idx is not None:
+        global_ns, _ = parser.parse_known_args(raw[:add_idx] + ['add'])
+        add_ns = p_add.parse_intermixed_args(raw[add_idx + 1:])
+        add_ns.cmd = 'add'
+        add_ns.config = global_ns.config
+        args = add_ns
+    else:
+        args = parser.parse_args(raw)
+
+    config_path = args.config or os.environ.get("TASK_CONFIG_PATH") or find_config()
+    if not config_path:
+        print("No config found. Use -c/--config, set TASK_CONFIG_PATH, "
+              "or place conf.yaml at ~/.config/tasker/conf.yaml")
+        sys.exit(1)
+
+    config = load_config(config_path)
+
+    if args.cmd == "project":
+        if args.proj_cmd == "list":
+            cmd_project_list(args, config, config_path)
+        elif args.proj_cmd == "add":
+            cmd_project_add(args, config, config_path)
+    elif args.cmd in COMMANDS:
+        COMMANDS[args.cmd](args, config, config_path)
+
+
+if __name__ == "__main__":
+    main()
